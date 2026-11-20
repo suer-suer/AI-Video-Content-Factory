@@ -18,6 +18,10 @@ _REAL_WS = Path(__file__).resolve().parents[1]
 def _force_local_mode_on_real_workspace(monkeypatch):
     from core import tenants
 
+    # The host-header guard allowlist: TestClient's Host is "testserver",
+    # which is not loopback — allow it for every test.
+    monkeypatch.setenv("PIPELINE_ALLOWED_HOSTS", "testserver")
+
     orig = tenants.read_flags
 
     def _patched(workspace):

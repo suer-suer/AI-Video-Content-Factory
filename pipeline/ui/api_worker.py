@@ -176,12 +176,23 @@ async def api_worker_artifact(run_id: str, rel: str, request: Request):
         dest = (rd / rel_norm).resolve()
         if not str(dest).startswith(str(rd.resolve())):
             return JSONResponse({"error": "path outside run directory"}, status_code=400)
-        payload = await request.body()
-        if len(payload) > _MAX_ARTIFACT_BYTES:
-            return JSONResponse({"error": "artifact exceeds size cap"}, status_code=413)
+        # stream to a temp file with a running size cap (review fix: the old
+        # code read the whole artifact into memory before checking the cap)
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_suffix(dest.suffix + ".part")
-        tmp.write_bytes(payload)
+        received = 0
+        try:
+            with tmp.open("wb") as fh:
+                async for chunk in request.stream():
+                    received += len(chunk)
+                    if received > _MAX_ARTIFACT_BYTES:
+                        fh.close()
+                        tmp.unlink(missing_ok=True)
+                        return JSONResponse({"error": "artifact exceeds size cap"}, status_code=413)
+                    fh.write(chunk)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
         tmp.replace(dest)
         return {"ok": True, "path": f"runs/{run_id}/{rel_norm}"}
 

@@ -112,6 +112,16 @@ class Router:
         self.budget_limit_usd: float = float(providers_cfg.get("budget_limit_usd", 0.0))
         self.fallbacks: dict[str, list[str]] = providers_cfg.get("fallbacks") or {}
         self.model_overrides: dict[str, str] = providers_cfg.get("_model_overrides") or {}
+        self.pricing: dict = providers_cfg.get("_pricing") or {}
+        if not self.pricing:
+            try:
+                import yaml as _yaml
+
+                pp = Path(__file__).resolve().parents[2] / "config" / "pricing.yaml"
+                if pp.exists():
+                    self.pricing = _yaml.safe_load(pp.read_text(encoding="utf-8")) or {}
+            except Exception:  # noqa: BLE001 — pricing is optional
+                pass
         self.on_event = lambda msg: None  # CLI may inject a printer
 
     # -- main entry ----------------------------------------------------------
@@ -146,6 +156,8 @@ class Router:
             self.state.cache_put(key, ptype, provider.name, json.dumps(result, ensure_ascii=False))
             if isinstance(result, dict) and "usage" in result:
                 tokens = int((result["usage"] or {}).get("total_tokens") or 0)
+            if cost_usd <= 0:
+                cost_usd = self._estimate_cost(ptype, result)
             self.state.usage_add(self.run_id, ptype, provider.name, cost_usd, tokens)
             self._usage_jsonl(ptype, provider.name, cost_usd, tokens)
             return result
@@ -174,15 +186,42 @@ class Router:
         return hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
     def _check_budget(self, provider: Provider, cost_usd: float):
-        if cost_usd <= 0:
-            return
-        if self.budget_limit_usd <= 0:
-            raise ProviderError(tr(self.lang, "paid_needs_flag", provider=provider.name))
-        if self.state.usage_spent(self.run_id) + cost_usd > self.budget_limit_usd:
+        """Review fix: the budget used to be dead code (cost_usd was always 0).
+        Now: paid calls need budget_limit_usd > 0 AND the cumulative recorded
+        spend of this run (including pricing-based estimates) must fit."""
+        spent = self.state.usage_spent(self.run_id)
+        if cost_usd > 0:
+            if self.budget_limit_usd <= 0:
+                raise ProviderError(tr(self.lang, "paid_needs_flag", provider=provider.name))
+            if spent + cost_usd > self.budget_limit_usd:
+                raise BudgetExceeded(tr(
+                    self.lang, "budget_stop",
+                    spent=round(spent, 4), limit=self.budget_limit_usd,
+                ))
+        elif self.budget_limit_usd > 0 and spent >= self.budget_limit_usd:
             raise BudgetExceeded(tr(
                 self.lang, "budget_stop",
-                spent=round(self.state.usage_spent(self.run_id), 4), limit=self.budget_limit_usd,
+                spent=round(spent, 4), limit=self.budget_limit_usd,
             ))
+
+    def _estimate_cost(self, ptype: str, result: dict) -> float:
+        """Pricing-based cost estimate (config/pricing.yaml) so the recorded
+        spend and the budget are non-zero even for metered-by-usage APIs."""
+        price = (self.pricing or {}).get(ptype) or {}
+        if not price:
+            return 0.0
+        usage = (result or {}).get("usage") or {}
+        tokens = int(usage.get("total_tokens") or 0)
+        per_1m = price.get("usd_per_1m_tokens")
+        if tokens and per_1m:
+            return round(tokens / 1_000_000 * float(per_1m), 6)
+        chars = price.get("usd_per_1k_chars")
+        if chars and result.get("text"):
+            return round(len(result["text"]) / 1000 * float(chars), 6)
+        per_image = price.get("usd_per_image")
+        if per_image and ptype == "image":
+            return round(float(per_image), 6)
+        return 0.0
 
     def _execute_with_retries(self, provider: Provider, payload: dict) -> dict:
         delay = 1.0
@@ -207,9 +246,25 @@ class Router:
 
 
 def _resolve_secret(ref: str) -> str:
-    """Secrets come from environment, .env file, or OS keyring (keyring optional)."""
+    """Secrets come from the tenant's own .env (when a tenant context is
+    active), else from environment/.env/keyring (keyring optional).
+
+    Tenant isolation (review fix): inside a tenant context only tenant-scoped
+    secrets are readable — host keys in os.environ are invisible. Outside a
+    tenant, arbitrary refs are limited to the known provider-key allowlist so
+    a crafted api_key_ref cannot read host environment variables."""
     import os
     from core.secrets import load_env
+
+    from core import tenants as _tenants
+
+    if _tenants.current_tenant():
+        return _tenants.tenant_secret(Path(__file__).resolve().parents[2], ref)
+
+    if ref.startswith("TENANT_") or ref not in ALLOWED_KEY_REFS:
+        # not a known provider key: resolves to "" (review — a crafted
+        # api_key_ref must not read arbitrary host environment variables)
+        return ""
 
     if os.environ.get(ref):
         return os.environ[ref]
@@ -234,3 +289,16 @@ def _resolve_secret(ref: str) -> str:
     except Exception:
         pass
     return ""
+
+
+# Known provider-key variable names (host/owner level). A provider entry that
+# references anything outside this list resolves to "" unless a tenant-scoped
+# key was stored for it — this blocks "point api_key_ref at any host variable"
+# exfiltration (review).
+ALLOWED_KEY_REFS = {
+    "OPENROUTER_API_KEY", "B_AI_API_KEY", "SMALLEST_AI_API_KEY",
+    "ELEVENLABS_API_KEY", "FISH_AUDIO_API_KEY", "CARTESIA_API_KEY",
+    "JAMENDO_CLIENT_ID", "FREESOUND_TOKEN", "VOICESTUDIO_API_KEY",
+    "FAL_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+    "PIXABAY_API_KEY", "TTS_API_KEY", "UI_TOKEN", "WORKER_TOKEN",
+}

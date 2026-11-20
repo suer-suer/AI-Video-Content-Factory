@@ -180,9 +180,11 @@ class Orchestrator:
                 except Exception as e:  # noqa: BLE001 — any step failure stops the run
                     self.state.set_step(manifest.run_id, step, "failed", error=str(e))
                     self.state.set_run_status(manifest.run_id, "failed")
-                    # billing (P5-02): a failed run returns the credit it spent
+                    # billing (P5-02): a failed run returns the credit it spent —
+                    # exactly once per (tenant, run_id) via the ledger (review fix:
+                    # resume loops could farm credits before)
                     if self.data_root != self.workspace:
-                        tenants.refund_credit(self.workspace, self.data_root.name)
+                        tenants.refund_credit_once(self.workspace, self.data_root.name, manifest.run_id)
                     self.on_event(tr(self.lang, "step_fail", step=step, error=e))
                     raise
             self.state.set_run_status(manifest.run_id, "done")

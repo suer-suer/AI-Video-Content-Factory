@@ -5,6 +5,7 @@ set -euo pipefail
 
 TARGET="${1:-/opt/pipeline}"
 APP_USER="${SUDO_USER:-$USER}"
+REPO="${PIPELINE_REPO:-https://github.com/sursinges/AI-Video-Content-Factory.git}"
 
 echo "==> Packages (ffmpeg, python, caddy repo)"
 apt-get update -qq
@@ -32,7 +33,7 @@ mkdir -p "$TARGET"
 if [ -d "$TARGET/.git" ]; then
   git -C "$TARGET" pull --ff-only
 else
-  git clone https://github.com/sursinges/AI-Video-Content-Factory.git "$TARGET"
+  git clone "$REPO" "$TARGET"
 fi
 chown -R "$APP_USER":"$APP_USER" "$TARGET"
 cd "$TARGET"
@@ -47,16 +48,18 @@ echo "==> Python venv + dependencies ($PY)"
 # host: ./.venv/bin/pip install -e "pipeline[desktop]".
 
 echo "==> Config seed (Web edition; local file, not committed)"
-mkdir -p config data
-if [ ! -f config/ui_settings.yaml ]; then
-  cat > config/ui_settings.yaml <<'YAML'
+# NOTE: the app reads $TARGET/pipeline/config (WORKSPACE = pipeline dir),
+# not $TARGET/config — the old seed location was silently ignored (review fix).
+mkdir -p pipeline/config pipeline/data
+if [ ! -f pipeline/config/ui_settings.yaml ]; then
+  cat > pipeline/config/ui_settings.yaml <<'YAML'
 edition: web
-hosted_mode: false        # flip to true (with registration_open) to arm the sign-in gate
-registration_open: false
+hosted_mode: true          # review: the Web edition must not run with the API open
+registration_open: true
 max_concurrent_runs: 1
-workers_enabled: false    # true -> route launches to Hybrid Workers (RFC_HYBRID_WORKERS.md)
+workers_enabled: false     # true -> route launches to Hybrid Workers (RFC_HYBRID_WORKERS.md)
 YAML
-  chown "$APP_USER":"$APP_USER" config/ui_settings.yaml
+  chown "$APP_USER":"$APP_USER" pipeline/config/ui_settings.yaml
 fi
 
 echo "==> systemd service"

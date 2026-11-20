@@ -117,14 +117,44 @@ def secrets_env(workspace: str | Path) -> Path:
 
 
 def load_env_stacked(workspace: str | Path) -> None:
-    """Global .env first, tenant .env overrides — for in-process provider calls
-    (UI endpoints). Pipeline subprocesses get the same via PIPELINE_DATA_ROOT
-    inside Orchestrator.__init__."""
+    """Load the host .env only. Tenant keys are deliberately NOT pushed into
+    os.environ (review fix: they mixed across tenants and leaked into other
+    requests' subprocesses) — in-process code reads them via tenant_secret(),
+    tenant subprocesses get them via _tenant_env() overlay."""
     from core.secrets import load_env
 
     load_env(Path(workspace) / ".env")
-    if current_tenant():
-        load_env(tenant_dir(workspace) / ".env")
+
+
+_TENV_CACHE: dict[str, dict] = {}
+
+
+def read_tenant_env(workspace: str | Path, uid: str | None = None) -> dict:
+    """Parse the tenant's own .env into a dict (cached per uid)."""
+    uid = uid or current_tenant()
+    if not uid:
+        return {}
+    path = tenant_dir(workspace) / ".env"
+    key = f"{uid}:{path.stat().st_mtime_ns if path.exists() else 0}"
+    cached = _TENV_CACHE.get(f"{uid}")
+    if cached and cached[0] == key:
+        return cached[1]
+    env: dict[str, str] = {}
+    if path.exists():
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            env[k.strip()] = v.strip().strip("'\"")
+    _TENV_CACHE[f"{uid}"] = (key, env)
+    return env
+
+
+def tenant_secret(workspace: str | Path, ref: str, uid: str | None = None) -> str:
+    """Tenant-scoped secret lookup — the ONLY way tenant providers resolve keys.
+    Host keys in os.environ are invisible inside a tenant context."""
+    return read_tenant_env(workspace, uid).get(ref, "")
 
 
 def refund_credit(workspace: str | Path, uid: str) -> None:
@@ -371,6 +401,46 @@ def consume_credit(workspace: str | Path, user: dict) -> bool:
         if not r or r["credits"] < 1:
             return False
         conn.execute("UPDATE users SET credits = credits - 1 WHERE id=?", (user["id"],))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+# ---------- credit ledger (review fix: refunds must be once-per-run) ----------
+
+_LEDGER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS credit_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    uid TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(uid, run_id, kind)
+);
+"""
+
+
+def _ledger_conn(workspace: str | Path) -> sqlite3.Connection:
+    conn = _connect(workspace)
+    conn.executescript(_LEDGER_SCHEMA)
+    return conn
+
+
+def refund_credit_once(workspace: str | Path, uid: str, run_id: str) -> bool:
+    """Refund 1 credit for a failed/cancelled run — exactly once per (uid,
+    run_id), ledger-backed. Repeated failures, resume attempts or cancel-
+    then-resume loops can no longer farm credits."""
+    conn = _ledger_conn(workspace)
+    try:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO credit_ledger(uid, run_id, kind) VALUES (?, ?, 'refund')",
+            (uid, run_id))
+        if cur.rowcount == 0:
+            return False  # already refunded for this run
+        conn.execute(
+            "UPDATE users SET credits = credits + 1 "
+            "WHERE id=? AND role != 'admin' AND unlimited = 0", (uid,))
         conn.commit()
         return True
     finally:

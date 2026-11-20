@@ -47,6 +47,54 @@ async def _version_header(request, call_next):
     return response
 
 
+# Host-header allowlist (DNS rebinding protection, review fix). Loopback,
+# RFC1918/link-local IPs (phone LAN access) and PIPELINE_ALLOWED_HOSTS
+# (comma-separated domains behind a reverse proxy) are accepted.
+def _allowed_hosts() -> set[str]:
+    import ipaddress
+    import os
+
+    allowed = {"localhost"}
+    for extra in (os.environ.get("PIPELINE_ALLOWED_HOSTS") or "").split(","):
+        if extra.strip():
+            allowed.add(extra.strip().lower())
+    return allowed
+
+
+def _host_ok(host_header: str) -> bool:
+    import ipaddress
+
+    host = (host_header or "").split(":")[0].strip().lower()
+    if not host or host in _allowed_hosts():
+        return True
+    try:
+        return ipaddress.ip_address(host).is_private or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+@app.middleware("http")
+async def _host_guard(request, call_next):
+    host_hdr = request.headers.get("host") or ""
+    if not _host_ok(host_hdr):
+        return JSONResponse({"error": "unrecognized host"}, status_code=403)
+    return await call_next(request)
+
+
+# Host-wide endpoints (review: tenants must never reach host config/keys).
+# POST/PUT on these require an admin in hosted mode; the owner token passes.
+_HOST_ADMIN_PATHS = {
+    "/api/ui_settings", "/api/env_save", "/api/accounts/save", "/api/budget",
+    "/api/watched_save", "/api/profile/save", "/api/profiles/save-as",
+    "/api/presets/save", "/api/providers/defaults", "/api/providers/add",
+    "/api/catalog/setup", "/api/settings_import", "/api/brand_kit/save",
+    "/api/prompts/save", "/api/formats_save", "/api/yt_secret", "/api/yt_connect",
+    "/api/plugins/install", "/api/antidetect_add", "/api/browser/create",
+    "/api/browser/launch",
+}
+_HOST_ADMIN_PREFIXES = ("/api/proxykit/", "/api/browser/", "/api/antidetect/")
+
+
 def _ui_token() -> str:
     """Optional shared-secret for /api/* access (LAN exposure). Set UI_TOKEN in .env."""
     import os
@@ -81,9 +129,12 @@ async def _api_guard(request, call_next):
             return JSONResponse({"error": "invalid run_id"}, status_code=400)
     token = _ui_token()
     if token and path.startswith("/api/"):
-        ok = request.query_params.get("token") == token or request.headers.get("x-ui-token") == token
-        if not ok:
-            return JSONResponse({"error": "unauthorized: provide ?token=... (UI_TOKEN in .env)"}, status_code=401)
+        # endpoints with their own auth or that must stay public (review fix)
+        open_paths = ("/api/auth/", "/api/health", "/api/edition", "/api/worker/")
+        if not any(path.startswith(p) for p in open_paths):
+            ok = request.query_params.get("token") == token or request.headers.get("x-ui-token") == token
+            if not ok:
+                return JSONResponse({"error": "unauthorized: provide ?token=... (UI_TOKEN in .env)"}, status_code=401)
     return await call_next(request)
 
 
@@ -243,6 +294,19 @@ async def _tenant_middleware(request: Request, call_next):
                          and not path.startswith("/api/health")) or path.startswith("/files/")
                 if gated:
                     return JSONResponse({"error": "auth required", "auth": True}, status_code=401)
+        # Host-wide settings/keys: admin only (review — tenants must not edit
+        # host config, disable auth, or reach host .env / accounts / proxies).
+        if tenants.hosted_mode(WORKSPACE):
+            pth = request.url.path
+            if request.method in ("POST", "PUT") and (
+                    pth in _HOST_ADMIN_PATHS
+                    or any(pth.startswith(x) for x in _HOST_ADMIN_PREFIXES)):
+                u = user or {}
+                if not (u.get("role") == "admin"):
+                    tok = _ui_token()
+                    if not (tok and (request.query_params.get("token") == tok
+                                     or request.headers.get("x-ui-token") == tok)):
+                        return JSONResponse({"error": "admin only"}, status_code=403)
         response = await call_next(request)
     finally:
         if tset is not None:
@@ -313,17 +377,21 @@ def api_state():
     st.close()
 
     lib = _library()
-    topics = [dict(t) for t in lib.conn.execute("SELECT * FROM topics ORDER BY id DESC LIMIT 30")]
-    episodes = []
-    for e in lib.conn.execute("SELECT * FROM episodes ORDER BY run_id DESC LIMIT 30"):
-        d = dict(e)
-        row = _state().conn.execute("SELECT status FROM runs WHERE run_id=?", (d["run_id"],)).fetchone()
-        failed = _state().conn.execute("SELECT COUNT(*) c FROM steps WHERE run_id=? AND status='failed'",
-                                       (d["run_id"],)).fetchone()["c"]
-        d["status"] = ("failed" if failed else row["status"]) if row else d["status"]
-        episodes.append(d)
-    refs = [dict(x) for x in lib.conn.execute('SELECT * FROM "references" ORDER BY id DESC LIMIT 30')]
-    lib.close()
+    st2 = _state()
+    try:
+        topics = [dict(t) for t in lib.conn.execute("SELECT * FROM topics ORDER BY id DESC LIMIT 30")]
+        episodes = []
+        for e in lib.conn.execute("SELECT * FROM episodes ORDER BY run_id DESC LIMIT 30"):
+            d = dict(e)
+            row = st2.conn.execute("SELECT status FROM runs WHERE run_id=?", (d["run_id"],)).fetchone()
+            failed = st2.conn.execute("SELECT COUNT(*) c FROM steps WHERE run_id=? AND status='failed'",
+                                      (d["run_id"],)).fetchone()["c"]
+            d["status"] = ("failed" if failed else row["status"]) if row else d["status"]
+            episodes.append(d)
+        refs = [dict(x) for x in lib.conn.execute('SELECT * FROM "references" ORDER BY id DESC LIMIT 30')]
+    finally:
+        lib.close()
+        st2.close()
     return {"runs": runs, "topics": topics, "episodes": episodes, "references": refs}
 
 
@@ -364,6 +432,15 @@ def api_episode(body: dict, request: Request):
         overrides["subtitles"] = body["subtitles"]
     if body.get("video_scenes"):  # GAP-01: none (default) | hero | all
         overrides.setdefault("visual", {})["video_scenes"] = str(body["video_scenes"]).strip()
+    if body.get("export_dir"):
+        # Path containment (review): in hosted mode a tenant's export_dir must
+        # stay inside that tenant's data root — no arbitrary host folders.
+        ed = Path(str(body["export_dir"]).strip())
+        if tenants.hosted_mode(WORKSPACE) and tenants.current_tenant():
+            troot = Path(tenants.tenant_dir(WORKSPACE)).resolve()
+            if not ed.resolve().is_relative_to(troot):
+                return JSONResponse(
+                    {"error": "export_dir must be inside your workspace folder"}, status_code=400)
     # draft preview (P5): script + scene plan WITHOUT synthesis/render — the
     # user reviews it, then POST /api/run/{id}/render re-runs m2/m3 for real
     until_step = None
@@ -452,32 +529,32 @@ def api_run_publish(run_id: str, body: dict = None):
         manifest["overrides"]["publish_at"] = body["publish_at"]
     if body.get("visibility"):
         manifest["overrides"]["publish_visibility"] = body["visibility"]
-    path = WORKSPACE / "runs" / f"{run_id}.manifest.yaml"
+    path = runs_root() / f"{run_id}.manifest.yaml"
     path.write_text(yaml.safe_dump(manifest, allow_unicode=True), encoding="utf-8")
     # force m6 re-run: previous result (mock) must not block publishing
     st = _state()
     st.set_step(run_id, "m6_publish", "pending")
     st.close()
-    log = (WORKSPACE / "runs" / f"{run_id}.ui.log").open("a", encoding="utf-8")
+    log = (runs_root() / f"{run_id}.ui.log").open("a", encoding="utf-8")
     subprocess.Popen([str(PY), "-u", "-m", "core.cli", "resume", run_id, "--until", "m6_publish"],
                      env=_tenant_env(),
                      stdout=log, stderr=subprocess.STDOUT, cwd=str(WORKSPACE))
     return {"ok": True, "note": "publishing started; if account is not yet connected Google OAuth will open"}
 
 
-@app.post("/api/run/{run_id}/resume")
-def api_resume(run_id: str):
-    log = (WORKSPACE / "runs" / f"{run_id}.ui.log").open("a", encoding="utf-8")
-    subprocess.Popen([str(PY), "-u", "-m", "core.cli", "resume", run_id],
-                     stdout=log, stderr=subprocess.STDOUT, cwd=str(WORKSPACE),
-                     env=_tenant_env())
-    return {"ok": True}
-
-
 @app.post("/api/transcript")
 def api_transcript(body: dict):
     url = (body.get("url") or "").strip()
-    if "youtube" not in url and "youtu.be" not in url:
+    # SSRF fix (review): hostname allowlist instead of a substring check
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        host = ""
+    if parsed.scheme not in ("https", "http") or host not in (
+            "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"):
         return JSONResponse({"error": "not a valid YouTube link"}, status_code=400)
     cmd = [str(PY), "-u", str(WORKSPACE / "tools" / "youtube_transcript.py"), url,
            "--lang", body.get("lang", "en")]
@@ -538,6 +615,8 @@ def api_provider_defaults(body: dict):
 
 @app.post("/api/providers/add")
 def api_provider_add(body: dict):
+    from core.providers.router import ALLOWED_KEY_REFS as _ALLOWED_KEY_REFS_SNAPSHOT
+
     pid = (body.get("id") or "").strip()
     if not pid or not pid.replace("_", "").isalnum():
         return JSONResponse({"error": "id: use letters, numbers, _"}, status_code=400)
@@ -549,19 +628,28 @@ def api_provider_add(body: dict):
     provs = yaml.safe_load(path.read_text(encoding="utf-8"))
     provs["providers"] = provs.get("providers") or {}
     entry = {"type": body.get("type", "llm"), "adapter": body.get("adapter", "openai_compatible")}
-    for k in ("base_url", "model", "api_key_ref", "proxy", "ref_audio", "ref_text", "speaker"):
+    for k in ("base_url", "model", "proxy", "ref_audio", "ref_text", "speaker"):
         if body.get(k):
             entry[k] = body[k]
+    # Key handling (review fix): the caller sends the SECRET VALUE, not the
+    # name of an environment variable. It is stored in the caller's own .env
+    # under a generated ref — a crafted api_key_ref can no longer bind host
+    # secrets (e.g. OPENROUTER_API_KEY) to a foreign base_url.
+    if body.get("key"):
+        from core.envstore import save_key
+
+        uid = tenants.current_tenant() or "owner"
+        ref = f"TENANT_{uid}_{pid}".upper().replace("-", "_")
+        save_key(tenants.secrets_env(WORKSPACE), ref, str(body["key"]))
+        entry["api_key_ref"] = ref
+    elif body.get("api_key_ref") in _ALLOWED_KEY_REFS_SNAPSHOT:
+        # referencing a known catalog key is allowed (BYOK already stored)
+        entry["api_key_ref"] = body["api_key_ref"]
     provs["providers"][pid] = entry
     if body.get("make_default"):
         provs["defaults"] = {**(provs.get("defaults") or {}), entry["type"]: pid}
     path.write_text(yaml.safe_dump(provs, allow_unicode=True, sort_keys=False), encoding="utf-8")
     return {"ok": True}
-
-
-@app.get("/api/profile_yaml")
-def api_profile_yaml():
-    return {"yaml": (config_root() / "channel.profile.yaml").read_text(encoding="utf-8")}
 
 
 @app.post("/api/profile/save")
@@ -788,7 +876,7 @@ def api_notes_save(body: dict):
     import manager as notes_mgr
 
     try:
-        notes_mgr.write(body["path"], body["content"])
+        notes_mgr.write(body["path"], body["content"], root=data_root() / "notes")
         return {"ok": True}
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -894,9 +982,11 @@ async def ws_remote(ws: WebSocket):
         await ws.close(code=1008)
         return
     if tenants.hosted_mode(WORKSPACE) and not tok:
-        # hosted gate for the websocket (HTTP middleware does not cover WS)
+        # hosted gate for the websocket (HTTP middleware does not cover WS);
+        # the shared headless browser is admin-only (review: SSRF via ws/remote)
         sid = ws.cookies.get("ui_session") or ""
-        if not tenants.resolve_session(WORKSPACE, sid):
+        sess = tenants.resolve_session(WORKSPACE, sid) if sid else None
+        if not sess or sess.get("role") != "admin":
             await ws.accept()
             await ws.close(code=1008)
             return

@@ -155,15 +155,15 @@ def tenant_runs_global_ok(hosted_ws):
 
 def test_tenant_secrets_env_and_refund(tmp_path):
     from core import tenants
-    import os
     _tok = tenants.set_tenant("u_byok")
     try:
         env = tenants.secrets_env(tmp_path)
         env.write_text("MY_TENANT_KEY=abc" + chr(10), encoding="utf-8")
-        os.environ.pop("MY_TENANT_KEY", None)
-        tenants.load_env_stacked(tmp_path)
-        assert os.environ.get("MY_TENANT_KEY") == "abc"
-        os.environ.pop("MY_TENANT_KEY", None)
+        # review fix: tenant keys are read via tenant_secret, NOT os.environ
+        assert tenants.tenant_secret(tmp_path, "MY_TENANT_KEY") == "abc"
+        import os
+        assert os.environ.get("MY_TENANT_KEY") is None, \
+            "tenant keys must NOT leak into the process environment"
     finally:
         tenants.reset_tenant(_tok)
     # refund: regular user only (seed an admin first so refund@test.io is a user)

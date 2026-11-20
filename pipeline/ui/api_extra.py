@@ -16,6 +16,7 @@ from starlette.responses import JSONResponse
 from ui.server import (WORKSPACE, PY, _state, _library, app, api_presets, runs_root, data_root, config_root, load_env_ctx)
 
 BATCH: dict = {"running": False, "done": 0, "total": 0, "current": ""}
+_RUN_ID_RE = __import__("re").compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
 
 
 @app.post("/api/topics/add")
@@ -66,19 +67,33 @@ def api_batch_status():
 
 
 @app.post("/api/batch")
-def api_batch(body: dict):
+def api_batch(body: dict, request: "Request" = None):
     topics = [t.strip() for t in (body.get("topics") or "").splitlines() if t.strip()]
     if not topics:
         return JSONResponse({"error": "empty topic list"}, status_code=400)
     if BATCH["running"]:
         return JSONResponse({"error": "series batch already in progress"}, status_code=409)
+    # capture the tenant context + billing BEFORE the background thread starts
+    # (threads have no contextvar — the old version leaked into the host
+    # workspace and skipped credits; review fix)
+    from ui.server import _tenant_env, tenants as _t
+    user = getattr(request.state, "tenant_user", None) if request is not None else None
+    hosted = _t.hosted_mode(WORKSPACE)
+    if hosted and user and user.get("role") != "admin":
+        # one credit per episode, deducted upfront; failed runs are refunded
+        # once via the ledger (the pipeline refunds on failure)
+        for _tname in topics:
+            if not _t.consume_credit(WORKSPACE, user):
+                return JSONResponse({"error": "no credits", "credits": 0}, status_code=402)
+    root_at_submit = runs_root()
+    env_at_submit = _tenant_env()
 
     def worker():
         BATCH.update(running=True, done=0, total=len(topics), current="")
         for i, topic in enumerate(topics):
             BATCH["current"] = topic
             num = 1
-            for p in (runs_root()).glob("ep-*.manifest.yaml"):
+            for p in root_at_submit.glob("ep-*.manifest.yaml"):
                 try:
                     num = max(num, int(p.name.split("-")[1].split(".")[0]) + 1)
                 except (ValueError, IndexError):
@@ -90,10 +105,10 @@ def api_batch(body: dict):
                         "target_minutes": min(int(body.get("target_minutes", 1)), 60),
                         "language": body.get("language", "ru"), "reference_urls": [],
                         "profile": "config/channel.profile.yaml", "overrides": {}}
-            path = runs_root() / f"{run_id}.manifest.yaml"
+            path = root_at_submit / f"{run_id}.manifest.yaml"
             path.write_text(yaml.safe_dump(manifest, allow_unicode=True), encoding="utf-8")
             subprocess.run([str(PY), "-u", "-m", "core.cli", "run", str(path)],
-                           capture_output=True, cwd=str(WORKSPACE))
+                           capture_output=True, cwd=str(WORKSPACE), env=env_at_submit)
             BATCH["done"] = i + 1
         BATCH["running"] = False
         BATCH["current"] = ""
@@ -271,10 +286,15 @@ def api_cover_list(run_id: str):
 def api_cover_set(body: dict):
     run_id = body.get("run_id", "")
     run_dir = runs_root() / run_id
-    chosen = body.get("path", "")
-    if not chosen.startswith("runs/"):
+    chosen = str(body.get("path", "")).replace("\\", "/")
+    # Containment (review fix): startswith("runs/") allowed "runs/../.env".
+    # Resolve and require the target to be an image INSIDE the run dir.
+    if not _RUN_ID_RE.match(run_id) or not chosen.startswith("runs/"):
         return JSONResponse({"error": "path outside run directory"}, status_code=400)
-    src = WORKSPACE / chosen
+    src = (WORKSPACE / chosen).resolve()
+    runs_base = (WORKSPACE / "runs").resolve()
+    if not src.is_relative_to(runs_base) or src.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+        return JSONResponse({"error": "path outside run directory"}, status_code=400)
     if not src.exists():
         return JSONResponse({"error": "file not found"}, status_code=404)
     import shutil
@@ -454,6 +474,7 @@ def api_proxykit_cmd(body: dict):
 
 
 # --- static ---
+@app.post("/api/yt/secret")
 def api_yt_secret(body: dict):
     from pathlib import Path
 
@@ -834,10 +855,9 @@ def api_run_modify_scene(run_id: str, body: dict):
                 return JSONResponse({"error": "scene has no still image to animate"}, status_code=400)
             provs = yaml.safe_load((config_root() / "providers.yaml").read_text(encoding="utf-8"))
             from core.providers import router as router_mod
-            from core.state import StateDB
 
             load_env_ctx()
-            st = StateDB(data_root() / "state.db")
+            st = _state()
             try:
                 router = router_mod.Router(provs, st, run_id, rd)
                 clip = rd / "visual" / "clips" / f"{sc['id']}.mp4"
@@ -961,7 +981,8 @@ def api_run_scene_voice(run_id: str, body: dict):
     scenes_f = rd / "visual" / "scenes.json"
     if not scenes_f.exists():
         return JSONResponse({"error": "scenes not found"}, status_code=404)
-    scenes = json.loads(scenes_f.read_text(encoding="utf-8")).get("scenes", [])
+    scenes_doc = json.loads(scenes_f.read_text(encoding="utf-8"))
+    scenes = scenes_doc.get("scenes", [])
     if idx < 0 or idx >= len(scenes):
         return JSONResponse({"error": "scene index out of range"}, status_code=400)
     sc = scenes[idx]
@@ -999,7 +1020,8 @@ def api_run_scene_voice(run_id: str, body: dict):
         return JSONResponse({"error": str(e)}, status_code=502)
 
     sc["voice"] = {"provider": pid, "voice": voice or "default"}
-    scenes_f.write_text(json.dumps({"scenes": scenes}, ensure_ascii=False, indent=2), encoding="utf-8")
+    scenes_doc["scenes"] = scenes  # preserve any other top-level scenes.json keys
+    scenes_f.write_text(json.dumps(scenes_doc, ensure_ascii=False, indent=2), encoding="utf-8")
     audio_path = res.get("audio_path", str(out))
     url = f"/files/runs/{run_id}/visual/scene_audio/{out.name}?t={int(time.time())}"
     return {"ok": True, "url": url, "audio_path": audio_path,
@@ -1141,16 +1163,37 @@ def api_run_render(run_id: str, request: "Request" = None):
 
 @app.post("/api/run/{run_id}/cancel")
 def api_run_cancel(run_id: str, request: "Request" = None):
-    """P5-03: cancel a queued or running run; queued/failed refunds the credit."""
+    """P5-03: cancel a queued or running run; queued/failed refunds the credit —
+    exactly once per (tenant, run_id) via the ledger (review fix)."""
     from ui.server import _run_queue, _queue_lock, _procs, tenants as _t, WORKSPACE as _WS
     user = getattr(request.state, "tenant_user", None) if request is not None else None
+    hosted = _t.hosted_mode(_WS)
+    # ownership (review fix): run_id values are per-tenant — a non-admin can
+    # only cancel a run that exists in their own tenant state db
+    if hosted and user and user.get("role") != "admin":
+        own = Path(_t.tenant_dir(_WS) / "data" / "state.db")
+        if not own.exists():
+            return JSONResponse({"error": "run not found"}, status_code=404)
+        from core.state import StateDB as _SDB
+
+        own_db = _SDB(own)
+        try:
+            if not own_db.get_run(run_id):
+                return JSONResponse({"error": "run not found"}, status_code=404)
+        finally:
+            own_db.close()
+
+    def _maybe_refund():
+        if hosted and user and not (user.get("role") == "admin" or user.get("unlimited")):
+            return _t.refund_credit_once(_WS, user["id"], run_id)
+        return False
+
     with _queue_lock:
         for job in list(_run_queue):
             if job["run_id"] == run_id:
                 _run_queue.remove(job)
-                if user and not (user.get("role") == "admin" or user.get("unlimited")):
-                    _t.refund_credit(_WS, user["id"])
-                return {"ok": True, "cancelled": "queued", "refunded": True}
+                refunded = _maybe_refund()
+                return {"ok": True, "cancelled": "queued", "refunded": refunded}
     proc = _procs.get(run_id)
     if proc and proc.poll() is None:
         proc.terminate()
@@ -1160,9 +1203,8 @@ def api_run_cancel(run_id: str, request: "Request" = None):
                         "WHERE run_id=? AND status IN ('running','pending')", (run_id,))
         st.conn.commit()
         st.close()
-        if user and not (user.get("role") == "admin" or user.get("unlimited")):
-            _t.refund_credit(_WS, user["id"])
-        return {"ok": True, "cancelled": "running", "refunded": True}
+        refunded = _maybe_refund()
+        return {"ok": True, "cancelled": "running", "refunded": refunded}
     return JSONResponse({"error": "run is not active"}, status_code=404)
 
 

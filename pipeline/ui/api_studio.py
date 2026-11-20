@@ -212,12 +212,21 @@ def api_motion_render(body: dict):
 # --- block studio: forward construction ----------------------------------------
 
 @app.post("/api/studio/build")
-def api_studio_build(body: dict):
+def api_studio_build(body: dict, request: "Request" = None):
     """Forward construction: user composes scenes (text + image/prompt + effect),
     we TTS each, generate images where asked, render motion, concat, mux."""
     scenes = body.get("scenes") or []
     if not scenes:
         return JSONResponse({"error": "empty scene list"}, status_code=400)
+    # credits (review fix): studio builds consume one credit per scene for
+    # regular hosted users, same as conveyor launches
+    import ui.server as _srv
+
+    user = getattr(request.state, "tenant_user", None) if request is not None else None
+    if _srv.tenants.hosted_mode(_srv.WORKSPACE) and user and user.get("role") != "admin" and not user.get("unlimited"):
+        for _ in scenes:
+            if not _srv.tenants.consume_credit(_srv.WORKSPACE, user):
+                return JSONResponse({"error": "no credits", "credits": 0}, status_code=402)
     num = 1
     for p in (runs_root()).glob("studio-*.manifest.yaml"):
         try:

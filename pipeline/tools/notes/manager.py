@@ -39,9 +39,10 @@ def read(rel: str, root=None) -> str:
     return f.read_text(encoding="utf-8") if f.exists() else ""
 
 
-def write(rel: str, content: str):
-    f = (NOTES / rel).resolve()
-    if NOTES not in f.parents:
+def write(rel: str, content: str, root=None):
+    notes_root = _notes_dir(root)
+    f = (notes_root / rel).resolve()
+    if notes_root not in f.parents:
         raise ValueError("путь вне notes/")
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text(content, encoding="utf-8")

@@ -4,6 +4,7 @@ Imported at the end of ui/api_extra.py."""
 
 import json
 import time
+import datetime
 from pathlib import Path
 
 import yaml
@@ -234,17 +235,22 @@ VISUAL_PRESETS_FILE = WORKSPACE / "config" / "visual_presets.yaml"  # host defau
 VISUAL_PRESETS_CUSTOM = WORKSPACE / "config" / "visual_presets_custom.yaml"
 
 
+def _visual_presets_custom_path() -> Path:
+    """Per-tenant custom overlay path, resolved per request (review fix: the
+    old module-level global raced between tenants — saves went to whoever
+    read last)."""
+    return data_root() / "config" / "visual_presets_custom.yaml"
+
+
 def _visual_presets_merged() -> dict:
     """Main presets + user-created/overridden ones (custom file never touches the main YAML)."""
     data = {}
     if VISUAL_PRESETS_FILE.exists():
         data = yaml.safe_load(VISUAL_PRESETS_FILE.read_text(encoding="utf-8")) or {}
-    # per-tenant custom overlay lives in the tenant config (P5-02)
-    global VISUAL_PRESETS_CUSTOM
-    VISUAL_PRESETS_CUSTOM = data_root() / "config" / "visual_presets_custom.yaml"
+    custom_p = _visual_presets_custom_path()
     custom = {}
-    if VISUAL_PRESETS_CUSTOM.exists():
-        custom = yaml.safe_load(VISUAL_PRESETS_CUSTOM.read_text(encoding="utf-8")) or {}
+    if custom_p.exists():
+        custom = yaml.safe_load(custom_p.read_text(encoding="utf-8")) or {}
     merged = {"default_preset": data.get("default_preset", "dark_history_cinematic")}
     presets = dict(data.get("presets") or {})
     presets.update(custom.get("presets") or {})
@@ -262,11 +268,13 @@ def api_visual_presets_save(body: dict):
     key = (body.get("key") or "").strip()
     if not key.replace("_", "").replace("-", "").isalnum():
         return JSONResponse({"error": "invalid preset key: use letters, numbers, _, -"}, status_code=400)
+    custom_p = _visual_presets_custom_path()
     custom = {"presets": {}}
-    if VISUAL_PRESETS_CUSTOM.exists():
-        custom = yaml.safe_load(VISUAL_PRESETS_CUSTOM.read_text(encoding="utf-8")) or {"presets": {}}
+    if custom_p.exists():
+        custom = yaml.safe_load(custom_p.read_text(encoding="utf-8")) or {"presets": {}}
     custom.setdefault("presets", {})[key] = body.get("preset") or {}
-    VISUAL_PRESETS_CUSTOM.write_text(yaml.safe_dump(custom, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    custom_p.parent.mkdir(parents=True, exist_ok=True)
+    custom_p.write_text(yaml.safe_dump(custom, allow_unicode=True, sort_keys=False), encoding="utf-8")
     return {"ok": True}
 
 
@@ -460,11 +468,13 @@ def api_trend_scout(niche: str, max_results: int = 15):
                              "Scraping is prohibited in core platform architecture."}, status_code=400)
     import httpx
 
+    days = 30
+    published_after = (datetime.datetime.utcnow() - datetime.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         with httpx.Client(timeout=30) as client:
             r = client.get("https://www.googleapis.com/youtube/v3/search", params={
                 "key": key, "part": "snippet", "q": niche, "type": "video",
-                "order": "viewCount", "publishedAfter": "2026-06-01T00:00:00Z",
+                "order": "viewCount", "publishedAfter": published_after,
                 "maxResults": min(max_results, 25)})
             r.raise_for_status()
             ids = [it["id"]["videoId"] for it in r.json().get("items", [])]
@@ -512,6 +522,8 @@ def api_settings_export():
 
 @app.post("/api/settings_import")
 def api_settings_import(body: dict):
+    from core import tenants as _t
+
     for name, fname in (("channel_profile", "channel.profile.yaml"),
                         ("providers", "providers.yaml"), ("ui_settings", "ui_settings.yaml")):
         text = body.get(name)

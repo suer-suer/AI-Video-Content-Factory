@@ -18,6 +18,13 @@ COPY LICENSE /app/LICENSE
 
 RUN pip install --no-cache-dir -e /app/pipeline
 
+# Seed the Web edition flags (a mounted volume overrides these). Without this
+# file the app defaults to the Desktop edition and the API runs unauthenticated
+# behind the container port (review fix).
+RUN mkdir -p /app/pipeline/config && \
+    printf 'edition: web\nhosted_mode: true\nregistration_open: true\nmax_concurrent_runs: 1\nworkers_enabled: false\n' \
+      > /app/pipeline/config/ui_settings.yaml
+
 ENV PYTHONUNBUFFERED=1 \
     PIPELINE_EDITION=web
 
