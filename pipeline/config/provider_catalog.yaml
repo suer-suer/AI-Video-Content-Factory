@@ -64,6 +64,14 @@ catalog:
     default_model: default
     key_ref: VOICESTUDIO_API_KEY
     docs: https://github.com/debpalash/VoiceStudio
+  - id: voxcpm
+    name: VoxCPM (local TTS — voice design, 30+ languages, 48 kHz)
+    icon: VX
+    type: tts
+    adapter: voxcpm
+    default_model: openbmb/VoxCPM2
+    key_ref: ""
+    docs: https://github.com/OpenBMB/VoxCPM
   - id: elevenlabs
     name: ElevenLabs (Expressive voice cloning)
     icon: EL

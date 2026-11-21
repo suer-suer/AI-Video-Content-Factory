@@ -67,6 +67,7 @@ def build_registry(providers_cfg: dict, resolve_secret) -> dict[str, Provider]:
     from core.providers import vheer_browser as vheer_mod
     from core.providers import smallest_ai as smallest_mod
     from core.providers import voice_studio as vstudio_mod
+    from core.providers import voxcpm as voxcpm_mod
 
     adapters = {
         "mock": mock_mod.MockProvider,
@@ -87,6 +88,7 @@ def build_registry(providers_cfg: dict, resolve_secret) -> dict[str, Provider]:
         "vheer_browser": vheer_mod.VheerBrowserProvider,
         "smallest_ai": smallest_mod.SmallestAIProvider,
         "voice_studio": vstudio_mod.VoiceStudioProvider,
+        "voxcpm": voxcpm_mod.VoxCPMProvider,
     }
     registry: dict[str, Provider] = {}
     for name, cfg in (providers_cfg.get("providers") or {}).items():

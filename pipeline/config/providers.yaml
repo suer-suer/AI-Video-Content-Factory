@@ -78,6 +78,16 @@ providers:
     api_key_ref: VOICESTUDIO_API_KEY
     timeout_sec: 300
 
+  # VoxCPM (OpenBMB, Apache-2.0) — local TTS with voice cloning and design,
+  # 30+ languages, 48 kHz. GPU recommended (8 GB VRAM); CPU works but is slow.
+  # Install: pip install voxcpm  (model downloads from HuggingFace on first use)
+  voxcpm:
+    type: tts
+    adapter: voxcpm
+    model: openbmb/VoxCPM2
+    cfg_value: 2.0
+    inference_timesteps: 10
+
   # F5-TTS Russian finetune (hotstone228, 813k steps, MIT) — owner pick for
   # live-quality narration. Voice = reference sample (5-12 s) + its transcript;
   # current reference was synthesized by Silero — replace ref_audio with a real
@@ -201,11 +211,11 @@ providers:
     type: publish
     adapter: youtube_api
 
-  # OpenRouter provider (glm-5.2:free, owner key)
+  # OpenRouter provider (free auto-router, owner key)
   openrouter:
     type: llm
     adapter: openai_compatible
     base_url: https://openrouter.ai/api/v1
-    model: z-ai/glm-5.2:free
+    model: openrouter/free
     api_key_ref: OPENROUTER_API_KEY
     timeout_sec: 180

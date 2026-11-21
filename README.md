@@ -7,9 +7,9 @@
 [![Platform: Windows](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey.svg)](#system-requirements)
 [![Status: Operational](https://img.shields.io/badge/status-active%20development-brightgreen.svg)](#project-status--roadmap)
 
-**AI Video Content Factory** is an open modular system for automated, end-to-end video production. It transforms topics, ideas, or existing scripts into fully assembled, narrated videos with synchronized voiceover, animated scene visuals, ambient audio mixing, subtitles, and publishing metadata.
+**AI Video Content Factory** is an open modular system for automated, end-to-end video production — a **neural video conveyor** that transforms topics, ideas, or existing scripts into fully assembled, narrated videos with synchronized voiceover, animated scene visuals, ambient audio mixing, subtitles, and publishing metadata.
 
-Designed to be **universal**, the factory supports multiple content formats and genres: **short vertical videos (9:16 Shorts/Reels/TikTok)**, **explainer videos (16:9)**, **tech & product reviews**, **educational documentaries**, and **immersive narratives**.
+The conveyor is format-agnostic: any video format is just a configuration. Built-in presets cover common use cases, and **format packs** (see [`pipeline/docs/FORMAT_PACKS.md`](pipeline/docs/FORMAT_PACKS.md)) let you plug in external renderers — Remotion, Three.js, Motion Canvas — for styles the core doesn't handle (toon animation, kinetic typography, dataviz, and more).
 
 ---
 
