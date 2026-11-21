@@ -5,7 +5,7 @@ set -euo pipefail
 
 TARGET="${1:-/opt/pipeline}"
 APP_USER="${SUDO_USER:-$USER}"
-REPO="${PIPELINE_REPO:-https://github.com/sursinges/AI-Video-Content-Factory.git}"
+REPO="${PIPELINE_REPO:-https://github.com/suer-suer/AI-Video-Content-Factory.git}"
 
 echo "==> Packages (ffmpeg, python, caddy repo)"
 apt-get update -qq

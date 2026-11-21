@@ -131,7 +131,7 @@ The edition is detected from `PIPELINE_EDITION` env → `ui_settings.yaml` → d
 
 ### Step 1: Clone the repository
 ```bash
-git clone https://github.com/sursinges/AI-Video-Content-Factory.git
+git clone https://github.com/suer-suer/AI-Video-Content-Factory.git
 cd AI-Video-Content-Factory
 ```
 

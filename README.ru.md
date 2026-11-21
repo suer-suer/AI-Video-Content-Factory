@@ -134,7 +134,7 @@ flowchart LR
 
 ### Шаг 1: Клонируй репозиторий
 ```bash
-git clone https://github.com/sursinges/AI-Video-Content-Factory.git
+git clone https://github.com/suer-suer/AI-Video-Content-Factory.git
 cd AI-Video-Content-Factory
 ```
 
